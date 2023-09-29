@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# 
+# Fruster switch
+# Version 0.0.1
+# 
+# This script is a util to help switch between kubernetes cluster and its corresponding deis installation (if any)
+# See usage for details. 
+
+# Exit on error. Append "|| true" if you expect an error.
+set -o errexit
+# Exit on error inside any functions or subshells.
+set -o errtrace
+# Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o nounset
+# Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o pipefail
+
+DEBUG=0
+FRUSTER_SWITCH_HOME=~/.fruster-switch
+DEFAULT_DEIS_HOME="$HOME/.deis"
+DEIS_HOME=${DEIS_HOME:-$DEFAULT_DEIS_HOME}
+
+DEFAULT_KUBE_HOME="$HOME/.kube"
+KUBE_HOME=${KUBE_HOME:-$DEFAULT_KUBE_HOME}
+
+if [ -f "./shared/utils" ] ; then
+  source ./shared/utils
+else 
+  source /usr/local/fruster/scripts/shared/utils
+fi
+
+usage () {
+	cat << EOF
+Usage: fruster-switch -OPTION [CLUSTER ALIAS]
+
+Switch to other active kubernetes cluster and its deis installation (if any).
+
+Any kubectl or deis commands will be invoked with this cluster as target.
+
+OPTIONS:
+  -i      init fruster-switch
+  -a      add kube cluster
+  -v      verbose logging
+  -h      show this message
+
+EXAMPLES:
+
+    # Switch to cluster named "my-cluster"
+    fruster-switch my-cluster
+
+    # Initalizes fruster-switch
+    fruster-switch -i
+
+    # Starts interactive wizard to add "my-cluster" to fruster-switch
+    fruster -a my-cluster
+
+EOF
+	exit
+}
+
+init() {
+  log_info "Initializing fruster-switch..."
+  mkdir -p $FRUSTER_SWITCH_HOME  
+}
+
+addCluster() {
+  if [ -z ${1:-} ]; then
+    log_error "Missing cluster alias"
+    exit
+  fi
+  
+  clusterAlias=$1
+  clusterDir=$FRUSTER_SWITCH_HOME/$clusterAlias
+  clusterKubeConfig=$clusterDir/kubeconfig
+  clusterDeisConfig=$clusterDir/deisconfig
+  
+
+  if promptDefaultYes "Configure for kubernetes access"; then
+    if [ -f $clusterKubeConfig ]; then
+      if promptDefaultYes "Kube config for cluster $clusterAlias already exists ($clusterKubeConfig), do you want to keep it"; then
+        log_success "Keeping cluster config $clusterKubeConfig"
+      else
+        configureKubernetes
+      fi
+    else 
+      # shitcode...    
+      configureKubernetes
+    fi
+  fi
+
+  echo ""
+
+  if promptDefaultYes "Configure for deis access"; then
+    if [ -f $clusterDeisConfig ]; then
+      if promptDefaultYes "Deis config for $clusterAlias already exists ($clusterDeisConfig), do you want to keep existing deis config"; then
+        log_success "Keeping deis config $clusterDeisConfig"
+      else
+        # shitcode...
+        configureDeis  
+      fi        
+    else      
+      configureDeis  
+    fi
+  fi
+
+  log_success "\nConfiguration completed for $clusterAlias (config written to $clusterDir).\nSwitch to this cluster by running:\n\n$ fruster-switch $clusterAlias"
+}
+
+configureKubernetes() {
+  read -p "Add cluster from kops (s)tate store or by providing a (y)aml file? " choice
+
+	case "$choice" in 
+		s|S) configureKubeFromKopsStateStore;;
+	  y|Y) configureKubeFromYamlFile;;
+	  * ) { echo "Invalid choice"; exit 1; };;
+	esac
+}
+
+configureKubeFromKopsStateStore() {
+  tempDir=$(mktemp -d)
+
+  # Set kops cluster name
+  read -p $'\n'"Enter kops cluster name:"$'\n> ' clusterName
+  
+  # Set kop state store bucket
+  defaultStateStoreBucket=${clusterName//\./-}-kops-state-store
+  read -p $'\n'"Enter state store bucket name (without s3:// prefix, press enter for $defaultStateStoreBucket):"$'\n> ' kopsStateStoreBucket
+
+  if [[ $kopsStateStoreBucket == "" ]]; then  
+    kopsStateStoreBucket=$defaultStateStoreBucket
+  fi
+  
+  if doesBucketExist $kopsStateStoreBucket; then
+    log_debug "State store buckets exists ${kopsStateStoreBucket}"
+  else
+    log_error "Bucket ${kopsStateStoreBucket} does not exist or do not access to it, are you sure you are using the correct AWS profile/keys?"
+    exit 1
+  fi
+
+  # Save kube config to temp file
+  tempKubeConfig=$tempDir/kubeconfig
+  KUBECONFIG=$tempKubeConfig kops export kubecfg --name $clusterName --state s3://$kopsStateStoreBucket
+  
+  mkdir -p $clusterDir && mv $tempKubeConfig $clusterDir
+}
+
+configureKubeFromYamlFile() { 
+  read -p $'\n'"Enter absolute path to YAML file that contains clusters kube config:"$'\n> ' clusterKubeConfig
+
+  if [ ! -f $clusterKubeConfig ]; then   
+    log_error "File does not exist: $clusterKubeConfig"
+    exit 1
+  fi
+
+  mkdir -p $clusterDir && cp $clusterKubeConfig $clusterDir/kubeconfig
+}
+
+configureDeis() {
+  read -p $'\n'"Enter url to deis router (example https://deis.example.com):"$'\n> ' deisController
+
+  set +o errexit
+  if curl $deisController &> /dev/null; then
+    set -o errexit
+  else
+    log_error "Deis controller $deisController could not be reached"
+    exit 1
+  fi
+
+  read -p $'\n'"Enter deis username (press enter for $(whoami)):"$'\n> ' deisUser  
+  read -p "Enter deis password:"$'\n> ' -s deisPassword
+
+  deisUser=${deisUser:-$(whoami)}
+    
+  set +o errexit
+
+  if DEIS_PROFILE=$clusterAlias deis login $deisController --username=$deisUser --password=$deisPassword ; then
+    rm -f $clusterDir/deisconfig
+    cp ${DEIS_HOME}/${clusterAlias}.json $clusterDir/deisconfig    
+  else
+    log_error "Failed logging in to deis as $deisUser"
+    exit 1
+  fi  
+
+  set -o errexit
+}
+
+switch() {
+  clusterDir=$FRUSTER_SWITCH_HOME/$1
+  kubeConfig=$clusterDir/kubeconfig
+  deisConfig=$clusterDir/deisconfig
+
+  if [ ! -f $kubeConfig ]; then
+    if [ ! -d $clusterDir ]; then
+      log_error "Cluster does not exist (directory does not exist: $clusterDir), add cluster by running:\n\n  fruster-switch -a"      
+    else 
+      log_error "File $kubeConfig was not found, but cluster dir $clusterDir exists, add cluster by running:\n\n  fruster-switch -a"
+    fi
+
+    exit 1    
+  fi
+
+  rm -f ${KUBE_HOME}/config
+  cp $kubeConfig ${KUBE_HOME}/config
+
+  if [ ! -f $deisConfig ]; then
+    log_error "Deis config does not exist: $deisConfig"
+  else
+    rm -f ${DEIS_HOME}/client.json    
+    cp $deisConfig ${DEIS_HOME}/client.json
+  fi
+  
+  log_info "Switched to cluster $1, here is cluster-info:"
+  kubectl cluster-info
+  deis whoami
+}
+
+validateDeps() {
+	checkBinary curl "https://curl.haxx.se/download.html"	
+	checkBinary jq "https://stedolan.github.io/jq/download/"	  
+}
+
+validateDeisHome() {
+  if [ ! -d $DEIS_HOME ]; then
+    log_error "Could not find deis home directory $DEIS_HOME, configure by setting env variable DEIS_HOME in case default $DEFAULT_DEIS_HOME does not work for you"
+    exit 1  
+  fi
+}
+
+validateKubeHome() {
+  if [ ! -d $KUBE_HOME ]; then
+    log_error "Could not find kube home directory $KUBE_HOME, configure by setting env variable KUBE_HOME in case default $DEFAULT_KUBE_HOME does not work for you"
+    exit 1  
+  fi
+}
+
+validateDeps
+validateDeisHome
+validateKubeHome
+
+while getopts ":vhia:" opt; do  
+	case $opt in    	    	  
+    v)
+	    DEBUG=1
+	    #set -o xtrace
+	    ;;	
+	  i)
+      init
+      ;;
+    a)
+      addCluster $OPTARG
+      exit
+      ;;	
+    h)
+      usage
+      ;;	
+    \?)
+      echo "Invalid option: -$OPTARG" >&2      
+      ;;    
+	esac
+	shift $(expr $OPTIND - 1 )
+done
+
+if [ -z ${1:-} ]; then
+  usage
+  exit
+fi
+
+switch $1
+

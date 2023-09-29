@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# 
+# Fruster Install Monitoring
+# Version 0.0.1
+#  
+# This script will install InfluxDB and Grafana onto your Kubernetes cluster
+
+# Exit on error. Append "|| true" if you expect an error.
+set -o errexit
+# Exit on error inside any functions or subshells.
+set -o errtrace
+# Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o nounset
+# Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o pipefail
+DEBUG=0
+
+if [ -f "./shared/utils" ] ; then
+  source ./shared/utils
+else 
+  source /usr/local/fruster/scripts/shared/utils
+fi
+
+usage () {
+	cat << EOF
+Usage: fruster-install-monitoring -option
+
+Installs NATS on an existing kubernetes cluster. 
+
+OPTIONS:
+  -n      kubernetes namespace used for Grafana and InfluxDB
+  -s      InfluxDB volume size (default 200Gi)
+  -v      verbose logging
+  -h 		  show this message
+  -p 		  Grafana admin user password
+
+EXAMPLES:
+
+	# Install monitoring pods with password for admin user "Password123"
+	fruster-install-nats -p Password123
+
+EOF
+	exit
+}
+
+validateDeps() {
+  cat << EOF
+-------------------
+> Validate binaries
+-------------------
+
+Validate that all requried binaries needed for this installation is present and executable.
+
+EOF
+  checkBinary kubectl "https://kubernetes.io/docs/tasks/tools/install-kubectl/"
+	checkBinary helm "https://github.com/kubernetes/helm#install"	
+  log_success "Step completed: Binary dependency checks passed"
+}
+
+upgradeHelm() {
+  cat << EOF
+-----------------------
+> Upgrading helm charts
+-----------------------
+
+Bumps local Helm charts from repositories
+
+EOF
+  helm up	
+  log_success "Helm charts are up to date"
+}
+
+installInfluxDB() {
+  cat << EOF
+---------------------
+> Installing InfluxDB
+---------------------
+
+Install InfluxDB onto your cluster using Helm.
+
+EOF
+  helm install \
+   --name influx \
+   --namespace "${NAMESPACE}" \
+   --set persistence.enabled=true,persistence.size="${INFLUXDB_VOLUME_SIZE:-200Gi}" \
+   stable/influxdb 
+
+  log_success "InfluxDB was successfully installed"
+}
+
+installGrafana() {
+  cat << EOF
+--------------------
+> Installing Grafana
+--------------------
+
+Install Grafana onto your cluster using Helm.
+
+Will expose Grafana UI usign Deis router. The admin UI can be reached on:
+http(s)://dashboard.{DEIS ROUTER FQDN}
+
+EOF
+  helm install \
+    --set persistence.enabled=true,persistence.accessModes={ReadWriteOnce},persistence.size=2Gi \
+    --set adminPassword="${GRAFANA_PASSWORD}" \
+   	--name grafana \
+    --namespace "${NAMESPACE}" \
+    stable/grafana
+
+  log_info "Setting Deis Router annotations to expose Grafana web"
+  
+  kubectl --namespace="${NAMESPACE}" label service grafana router.deis.io/routable="true" --overwrite
+  kubectl --namespace="${NAMESPACE}" annotate service grafana router.deis.io/domains=dashboard --overwrite
+
+  log_success "Grafana was installed, you may now login with u: admin p: ${GRAFANA_PASSWORD} at http(s)://dashboard.{DEIS ROUTER FQDN}"
+  log_success "Note that it may take a couple of minutes until everything is up and running"
+}
+
+
+while getopts "s:n:p:vh" opt; do
+  case $opt in    	
+  s) INFLUXDB_VOLUME_SIZE="$OPTARG" ;;
+  n) NAMESPACE="$OPTARG" ;;		
+  p) GRAFANA_PASSWORD="$OPTARG" ;;
+  v) DEBUG=1 ;;	
+  h) usage ;;
+  \?) echo "Invalid option: -$OPTARG" >&2 ;;    
+  esac
+done
+shift $(expr $OPTIND - 1 )
+
+NAMESPACE="${NAMESPACE:-monitoring}"
+GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-Fruster123}"
+
+validateDeps
+upgradeHelm
+installInfluxDB
+installGrafana
+
+
+
+

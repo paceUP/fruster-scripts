@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# 
+# Fruster Install NATS
+# Version 0.0.1
+# 
+# This script will install NATS on a Kubernetes Cluster.
+# See usage for details. 
+
+# Exit on error. Append "|| true" if you expect an error.
+set -o errexit
+# Exit on error inside any functions or subshells.
+set -o errtrace
+# Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o nounset
+# Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o pipefail
+
+DEBUG=0
+
+if [ -f "./shared/utils" ] ; then
+  source ./shared/utils
+else 
+  source /usr/local/fruster/scripts/shared/utils
+fi
+
+usage () {
+	cat << EOF
+Usage: fruster-install-nats -option [HOSTNAME]
+
+Installs NATS on an existing kubernetes cluster. 
+
+OPTIONS:
+  -n      kubernetes namespace where nats will be installed
+  -v      verbose logging
+  -h 		  show this message
+  -r		  num replicas, defaults to 3  
+
+EXAMPLES:
+
+	# Install NATS with namespace "paceup"
+	fruster-install-nats -n paceup
+
+EOF
+	exit
+}
+
+installNats() {
+  log_info "\nInstalling NATS..."
+
+	HELM_DEPLOYMENT_NAME=nats-${NATS_NAMESPACE}
+
+  # Check if nats is already installed
+  if helm ls |grep -q "${HELM_DEPLOYMENT_NAME}" ; then
+    log_error "NATS is already installed, run 'helm delete ${HELM_DEPLOYMENT_NAME} --purge' to uninstall"
+    exit 1
+  fi
+
+  if [ -z "${NATS_NAMESPACE:-}" ] ; then
+  	read -p "Choose namespace for NATS, this should be something related to a project and will be used as part of internal DNS name to access NATS later on (example 'paceup'): " NATS_NAMESPACE	
+  fi
+
+	curl -L https://github.com/FrostDigital/nats-helm-chart/archive/master.tar.gz --output /tmp/nats-helm-chart.tar.gz
+  helm install /tmp/nats-helm-chart.tar.gz --name ${HELM_DEPLOYMENT_NAME} --namespace ${NATS_NAMESPACE} --set replicas=${NUM_REPLICAS:-3}
+
+  log_success "NATS is installed and accesible on nats.${NATS_NAMESPACE}:4222"
+}
+
+validateDeps() {
+ 	log_info "\nValidating that all required binaries are installed..."
+	checkBinary kubectl "https://kubernetes.io/docs/tasks/tools/install-kubectl/"
+	checkBinary helm "https://github.com/kubernetes/helm#install"
+	log_success "Binary dependency checks passed"
+}
+
+while getopts ":vhn:r:" opt; do
+	case $opt in    	
+    k)
+		SSH_KEY="$OPTARG"
+		;;
+	n)
+		NATS_NAMESPACE="$OPTARG"
+		;;		
+    v)
+	    DEBUG=1
+	    #set -o xtrace
+	    ;;	
+	r)
+		NUM_REPLICAS="$OPTARG"
+		;;
+    h)
+		usage
+		;;	
+    \?)
+		echo "Invalid option: -$OPTARG" >&2      
+		;;    
+	esac
+	shift $(expr $OPTIND - 1 )
+done
+
+validateDeps
+validateCluster
+
+installHelm
+installNats

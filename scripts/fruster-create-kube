@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# 
+# Fruster Create Kube Script
+# Version 0.0.1
+# 
+# See usage for 
+# This script will bootstrap a Kubernetes on AWS
+# using kops do to the heavy lifting
+
+# Exit on error. Append "|| true" if you expect an error.
+set -o errexit
+# Exit on error inside any functions or subshells.
+set -o errtrace
+# Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o nounset
+# Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o pipefail
+
+DEBUG=0
+
+if [ -f "./shared/utils" ] ; then
+  source ./shared/utils
+else 
+  source /usr/local/fruster/scripts/shared/utils
+fi
+
+usage () {
+	cat << EOF
+Usage: fruster-create-kube -option [CLUSTER NAME]
+
+Creates a production grade Kubernetes cluster on AWS. 
+
+Cluster is created with private topololy with a bastion host to access it.
+
+This script is a thin layer on top of Kops which does the heavy lifting.
+
+OPTIONS:
+  -k      public ssh key used to access nodes, a new one will be created if none set
+  -z      aws availability zone where cluster is created, defaults to "eu-west-1a"
+  -v      verbose logging
+  -h      show this message
+
+The following env vars are supported for further customization:
+
+FRUSTER_KOPS_STATE_STORE   set name of S3 state store bucket, will use name of cluster and suffix "-kops-state-store" if none is provided
+FRUSTER_AWS_TENANCY        tenancy type of master and worker nodes, defaults to "default" which indicates shared tenancy
+FRUSTER_AWS_NODE_SIZE      aws node instance type of worker nodes, defaults to "m5.large"
+FRUSTER_ADMIN_CIDR         cidr block where admin access is allowed, for example office ip
+
+EXAMPLES:
+
+  # Create new cluster with default options
+  fruster-create-kube my-new-cluster
+
+  # Set admin access cidr
+  export FRUSTER_ADMIN_CIDR=test
+  fruster-create-kube my-new-cluster
+
+EOF
+	exit
+}
+
+validateDeps() {
+  cat << EOF
+  
+-------------------
+> Validate binaries
+-------------------
+
+Validate that all requried binaries needed for this installation is present and executable.
+
+EOF
+
+	checkBinary aws "https://docs.aws.amazon.com/cli/latest/userguide/installing.html"
+	checkBinary kubectl "https://kubernetes.io/docs/tasks/tools/install-kubectl/"
+	checkBinary kops "https://github.com/kubernetes/kops/blob/master/docs/install.md"
+	checkBinary jq "https://stedolan.github.io/jq/download/"
+	
+  log_success "Step completed: Binary dependency checks passed"
+}
+
+configureSshKey() {
+  cat << EOF
+  
+-------------------
+> Configure SSH key
+-------------------
+
+Validate that all requried binaries needed for this installation is present and executable.
+
+EOF
+
+  SSH_KEY=${SSH_KEY:-}
+
+  if [ ! -z $SSH_KEY ]; then
+    # Use provided SSH key
+    if [ ! -f "${SSH_KEY}" ]; then
+      log_error "SSH key '${SSH_KEY}' does not exist"
+      exit 1
+    else
+      log_debug "Using provided SSH key ${SSH_KEY}"
+    fi
+  else
+    # SSH key flag was not passed, create path based on cluster name
+    SSH_KEY_PRIV=~/.ssh/${KOPS_CLUSTER_NAME}.key
+        
+    # Check if key already exist at that location, if so prompt user
+    if [ -f "${SSH_KEY_PRIV}" ] ; then
+      if ! promptDefaultYes "Key ${SSH_KEY_PRIV} already exists, is this the correct key pair to use"; then      
+        exit 1
+      fi
+    else 
+      ssh-keygen -t rsa -b 4096 -C "`whoami`@frost.se" -N "" -f $SSH_KEY_PRIV      
+    fi 
+
+    SSH_KEY="${SSH_KEY_PRIV}.pub"
+  fi
+
+ 	log_success "Step completed: Using ssh key $SSH_KEY"
+}
+
+createStateStore() {
+  cat << EOF
+  
+-------------------------
+> Create kops state store
+-------------------------
+
+Kops saves cluster state in a S3 bucket. This bucket ${KOPS_STATE_STORE_NAME} will be created 
+in this step.
+
+EOF
+
+  if doesBucketExist ${KOPS_STATE_STORE_NAME};
+  then
+    if ! promptDefaultYes "Bucket ${KOPS_STATE_STORE_NAME} already exists, do want to (re)use this bucket to host clusters state store"; then
+      log_error "Ok, exiting - you need to either remove existing state store bucket or change state store name by setting env var FRUSTER_KOPS_STATE_STORE"
+      exit 1    
+    fi    
+    
+    log_success "Step completed: Existing state store bucket ${KOPS_STATE_STORE_NAME} is used"
+  else    
+    aws s3api create-bucket --bucket ${KOPS_STATE_STORE_NAME} --region us-east-1 &> /dev/null || (log_error "Failed creating state store bucket '${KOPS_STATE_STORE_NAME}', probably because bucket already exist or due to invalid permissions" && exit 1)
+    aws s3api put-bucket-versioning --bucket ${KOPS_STATE_STORE_NAME}  --versioning-configuration Status=Enabled
+	  
+    log_success "Step completed: State store bucket ${KOPS_STATE_STORE_NAME} created"
+  fi	
+}
+
+kopsCreateCluster() {
+  cat << EOF
+  
+----------------------
+> Creating the cluster
+----------------------
+
+During this step the actual installation will happen.
+
+Configuration will first be written to kops state store and then applied so kops may create
+all necessary resources on AWS.
+
+Be patient, this may take 5-10 minutes.
+
+EOF
+  # TODO: Add support for this line to install specifik version of k8s --kubernetes-version=1.15.10 
+	kops create cluster \
+	    --ssh-public-key ${SSH_KEY} \
+	    --topology=private \
+	    --networking=weave \
+	    --zones=${AWS_ZONE} \
+      --node-count=${NODE_COUNT} \
+	  	--node-size=${AWS_NODE_SIZE} \
+	  	--master-tenancy=${AWS_TENANCY} \
+	  	--node-tenancy=${AWS_TENANCY} \
+	  	--admin-access=${ADMIN_CIDR} \
+	  	--state=s3://${KOPS_STATE_STORE_NAME} \
+	  	--authorization=AlwaysAllow \
+	    --yes \
+	    $KOPS_CLUSTER_NAME
+
+	log_success "Step completed: Finished creating kops cluster"
+}
+
+setVars() {
+	if [[ "$1" != *.k8s.local ]]
+	then
+		log_info "Changing cluster name to ${1}.k8s.local (suffix .k8s.local is required for kops to create a cluster with Gossip enabled)"
+	  KOPS_CLUSTER_NAME=${1}.k8s.local	    
+	else
+	  KOPS_CLUSTER_NAME=${1}	    
+	fi
+
+	if [ -z "${FRUSTER_KOPS_STATE_STORE:-}" ]; then
+		KOPS_STATE_STORE_NAME="${KOPS_CLUSTER_NAME//\./-}-kops-state-store"
+	else
+		KOPS_STATE_STORE_NAME="${FRUSTER_KOPS_STATE_STORE}"
+	fi
+
+	AWS_NODE_SIZE=${FRUSTER_AWS_NODE_SIZE:-m5.large}
+	AWS_TENANCY=${FRUSTER_AWS_TENANCY:-default}
+	ADMIN_CIDR=${FRUSTER_ADMIN_CIDR:-0.0.0.0/0}
+  AWS_ZONE=${AWS_ZONE:-eu-west-1a}
+	NODE_COUNT=${NODE_COUNT:-2}
+
+
+	cat << EOF
+
+About to create cluster with following properties:
+
+Cluster name:       ${KOPS_CLUSTER_NAME}
+State store:        ${KOPS_STATE_STORE_NAME}
+Node size:          ${AWS_NODE_SIZE}
+Node count:         ${NODE_COUNT}
+Tenancy:            ${AWS_TENANCY} 
+Admin cidr:         ${ADMIN_CIDR} 
+AWS zone:           ${AWS_ZONE} 
+SSH key:            ${SSH_KEY:-None is set, will be created}
+EOF
+
+  echo ""
+
+  if ! promptDefaultYes "Is this correct"; then
+    exit 1
+  fi	
+}
+
+createBastion() {
+  cat << EOF
+
+---------------------
+> Create Bastion host
+---------------------
+
+Creates a Bastion host for the cluster.
+
+Note that this should be done by setting --bastion flag in during kops cluster creation but this
+cannot be done due to this issue https://github.com/kubernetes/kops/issues/2881, once fixed this can
+be simplified.
+
+EOF
+  kops create instancegroup bastions \
+    --role Bastion \
+    --subnet utility-${AWS_ZONE} \
+    --edit=false \
+    --name ${KOPS_CLUSTER_NAME} \
+    --state s3://${KOPS_STATE_STORE_NAME}
+
+  kops update cluster ${KOPS_CLUSTER_NAME} \
+    --state s3://${KOPS_STATE_STORE_NAME} \
+    --yes
+ 
+  log_success "Step completed: Bastion was created"    
+}
+
+showPostCreateInfo() {
+  cat << EOF
+
+-----------------------------------
+Congrats, cluster is being created!
+-----------------------------------
+
+IMPORTANT! Your cluster is probably not yet initialized, this takes a couple of minutes now! 
+
+Validate cluster state by running this command a couple of times to see that nodes and pods 
+transitions into ready state:
+
+  kops validate cluster --state s3://${KOPS_STATE_STORE_NAME}
+
+Here are some commands that may come in handy:
+
+  # Delete cluster (this will undo everything you just created but not remove SSH key)
+  kops delete cluster ${KOPS_CLUSTER_NAME} --state s3://${KOPS_STATE_STORE_NAME} --yes
+
+  # Connect to bastion
+  ssh -i ${SSH_KEY_PRIV:-your-private-key} admin@$(aws elb --output=json describe-load-balancers |jq -r .LoadBalancerDescriptions[].DNSName |grep bastion-${KOPS_STATE_STORE_NAME:0:15})
+
+EOF
+}
+
+while getopts ":fvhk:c:z:" opt; do
+	case $opt in    	
+    k)
+		SSH_KEY="$OPTARG"
+		;;
+		c)
+    NODE_COUNT="$OPTARG"
+		;;
+		z)
+		AWS_ZONE="$OPTARG"
+		;;		
+    v)
+    DEBUG=1
+    set -o xtrace
+    ;;
+    h)
+		usage
+    ;;
+    \?)
+    echo "Invalid option: -$OPTARG" >&2      
+    ;;    
+	esac
+	shift $(expr $OPTIND - 1 )
+done
+
+if [ -z ${1:-} ]
+	then
+    usage    
+fi
+
+setVars ${1:-""}
+
+validateDeps
+validateAws
+configureSshKey
+
+createStateStore
+kopsCreateCluster
+createBastion
+
+showPostCreateInfo
+

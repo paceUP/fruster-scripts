@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+
+log_debug () {
+	if [ $DEBUG == 1 ] ; then
+		echo $1
+	fi
+}
+
+log_info () {
+	echo -e '\033[0;96m'$1'\033[0m'
+}
+
+log_error () {
+	>&2 echo -e '\033[0;31m'$1'\033[0m'
+}
+
+log_success () {
+	echo -e '\033[0;32m'$1'\033[0m'
+}
+
+# Prompts user for yes/no
+#
+# $1 - Prompt message
+#
+# Returns 1 for yes and 0 for no
+prompt() {  
+  read -p "$1 (y/n)? " choice
+  case "$choice" in 
+    y|Y ) return 0;;
+    n|N ) return 1;;
+    * ) { echo "Invalid choice"; exit 1; };;
+  esac
+}
+
+# Prompts user for Yes/no where Yes (enter) is default.
+#
+# $1 - Prompt message
+#
+# Returns 1 for yes and 0 for no
+promptDefaultYes() {  
+  read -p "$1 (Y/n)? " choice
+  case "$choice" in 
+    y|Y|"") return 0;;
+    n|N ) return 1;;
+    * ) { echo "Invalid choice"; exit 1; };;
+  esac
+}
+
+# Checks if provided binary exists and is executable.
+#
+# $1 - Binary name, for example "aws"
+#
+checkBinary() {
+	set +o errexit
+	if command -v $1 > /dev/null ; then
+	  log_debug "Check passed: $1 was found $(command -v $1)"
+	else
+	  log_error "Check failed: $1 not found, follow instructions here to install it ${2:-*Oops, missing instructions*}"
+		exit 1
+	fi
+	set -o errexit
+}
+
+# Prompts user to verify that current kube context is the correct 
+# one to use.
+validateCluster() {
+	cat << EOF
+
+------------------------------
+> Validate kube cluster access
+------------------------------
+
+Validates access to kube cluster and the cluster we point to is the one
+to do changes on. Configuration for current cluster is found in ~/.kube/config.
+
+EOF
+	kubectl cluster-info |grep 'Kubernetes master'
+	if ! promptDefaultYes "Is above Kubernetes cluster the correct location"; then	
+		exit 1
+	fi
+	log_success "\nStep ${1:-} completed"
+}
+
+# Initializes helm tiller on kube cluster. Will not fail in case it already exists. 
+installHelm() {	
+	log_info "\nInitializing helm on cluster in case it is not already there..."
+	helm init > /dev/null
+	sleep 5
+	log_success "Helm is initialized"
+}
+
+# Validates that user has valid AWS credentials configured.
+validateAws() {
+	cat << EOF
+
+--------------------------
+> Validate AWS credentials
+--------------------------
+
+Validate that current shell session has access to AWS using aws cli.
+
+This is either picked up by env variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+or by the current active profile in ~/.aws/credentials
+
+EOF
+	# NOTE: Validate AWS by checking current active user, not sure if this is best way though
+	ACTIVE_AWS_USER=`aws iam --output=json get-user |jq -r .User.UserName`
+
+	if [ ! -z "$ACTIVE_AWS_USER" ] && [ "$ACTIVE_AWS_USER" != "null" ]; then
+		log_info "Logged in as AWS user '$ACTIVE_AWS_USER'"
+		
+		if [ -z "AWS_ACCESS_KEY_ID" ]; then log_info "Picked up user from AWS_ACCESS_KEY_ID ${AWS_ACCESS_KEY_ID}"; else echo "Picked up user from current active profile in ~/.aws/credentials"; fi
+	
+		if ! promptDefaultYes "Is this the correct user"; then
+			log_error "Change AWS user either by changing active profile in ~/.aws/credentials or by setting env variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+			exit 1
+		fi
+
+		log_success "Step ${1:-} completed: Logged in as AWS user $ACTIVE_AWS_USER"	
+	else 
+		log_error "Failed getting valid AWS credentials."
+		log_error "Make sure to either set env variables \$AWS_ACCESS_KEY_ID and \$AWS_SECRET_ACCESS_KEY or setup your ~/.aws/credentials to point to a valid AWS user"
+		exit 1
+	fi
+}
+
+# Validates if a bucket exists and belongs to active AWS user
+doesBucketExist() {
+		set +o errexit
+
+    if aws s3api head-bucket --bucket ${1};
+    then
+			log_debug "S3 bucket ${1} exists"
+    	set -o errexit 
+			return 0
+    else
+			log_debug "S3 bucket does NOT ${1} exist or user has not access to it"
+    	set -o errexit 
+      return 1
+    fi        
+}

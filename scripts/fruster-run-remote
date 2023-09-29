@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# 
+# Fruster Run Remote
+# Version 0.0.1
+# 
+# This script will run a node application locally but tunnel to NATS within
+# the k8s cluster.
+#
+# See usage for details. 
+
+# Exit on error. Append "|| true" if you expect an error.
+set -o errexit
+# Exit on error inside any functions or subshells.
+set -o errtrace
+# Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o nounset
+# Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o pipefail
+
+WATCH=0
+DEBUG=0
+APP=""
+NAMESPACE=""
+NUM_INSTANCES=1
+ENTRYPOINT="app.js"
+TYPESCRIPT=0
+
+if [ -f "./shared/utils" ] ; then
+  source ./shared/utils
+else 
+  source /usr/local/fruster/scripts/shared/utils
+fi
+
+usage () {
+	cat << EOF
+Usage: fruster-run-remote [-n NATS namespace] [-a deis app name] [-e app/service entrypoint]
+
+Run local node service remote by tunneling to NATS bus and copying 
+existing apps config. 
+
+OPTIONS:
+  -n      namespace of NATS on cluster
+  -a      name of deis app
+  -e      entry point to start (defaults to app.js)
+  -t      typescript enabled, will start app with ts-node-dev instead of nodemon 
+  -h      show this message
+
+EXAMPLES:
+	
+  fruster-run-remote -n instapool -a ip-user-service
+
+EOF
+	exit
+}
+
+validateDeps() {
+ 	log_info "\nValidating that all required binaries are installed..."
+	checkBinary kubectl "https://kubernetes.io/docs/tasks/tools/install-kubectl/"
+	checkBinary deis "https://github.com/deis/workflow-cli"
+	checkBinary nodemon "https://www.npmjs.com/package/nodemon"
+	log_success "Binary dependency checks passed"
+}
+
+#
+# Download config from deis app and set in env
+#
+source_deis_config () { 
+  workdir=~/deis-config-dump/$APP
+  
+  mkdir -p $workdir
+  deis config:pull -a $APP > $workdir/dump.env
+
+  # Add double quotes around values
+  sed -i.bak 's/\(=[[:blank:]]*\)\(.*\)/\1"\2"/' $workdir/dump.env
+
+  set -o allexport
+  source $workdir/dump.env
+  set +o allexport
+}
+
+validate_namespace () {
+  set +o errexit
+
+	if kubectl get ns $NAMESPACE ; then
+			log_success "NATS namespace ${NAMESPACE} exists"
+	else
+			log_error "NATS namespace ${NAMESPACE} does not exist"
+			exit 1;			
+	fi
+
+	set -o errexit
+}
+
+scaleUp () {
+  echo "Scaling up ${NUM_INSTANCES} instance(s) before exit)..."    
+  deis ps:scale cmd=${NUM_INSTANCES} -a $APP
+	pkill -a kubectl
+}
+
+nats_tunnel () {  
+  # Copy config from deis app
+  source_deis_config $APP
+
+  # Start tunnel
+  kubectl -n $NAMESPACE port-forward \
+    $(kubectl -n $NAMESPACE get pod -l app=nats -o template --template="{{(index .items 0).metadata.name}}") 4223:4222 &
+
+  # Overwrite BUS env to point to tunneled one
+  export BUS=nats://localhost:4223
+		
+  get_num_instances
+
+  deis ps:scale cmd=0 -a $APP
+
+  if (($TYPESCRIPT > 0)) ; then
+	ts-node-dev ${ENTRYPOINT:-"app.js"}
+  else
+  	nodemon ${ENTRYPOINT:-"app.js"}
+  fi
+
+  trap scaleUp EXIT INT TERM
+}
+
+# Get number of instances of deis app before scaling down
+# is needed in exit trap when scaling up again 
+get_num_instances () {
+  NUM_INSTANCES=$(($(deis ps -a $APP| wc -l) - 2))
+
+	if (($NUM_INSTANCES < 0)) ; then
+		NUM_INSTANCES=1
+	fi
+}
+
+while getopts "hta:n:e:" opt; do
+	case $opt in  
+		a)		 
+		  APP="$OPTARG"
+		  ;;  	
+		n)
+		  NAMESPACE="$OPTARG"
+		  ;;
+		e)		 
+		  ENTRYPOINT="$OPTARG"
+		  ;;
+		t)
+		  TYPESCRIPT=1
+	      ;;
+		h)
+			usage
+			;;	
+		\?)
+			echo "Invalid option: -$OPTARG" >&2      
+			;;    
+		esac
+	# shift $(expr $OPTIND - 1 )
+done
+
+if [ -z "${NAMESPACE:-}" ]; then
+	log_error "Missing NATS namespace"
+	usage
+	exit 1;
+fi
+
+if [ -z "${APP:-}" ]; then
+	log_error "Missing deis app"
+	usage
+	exit 1;
+fi
+
+validateDeps
+validate_namespace
+nats_tunnel 
+
