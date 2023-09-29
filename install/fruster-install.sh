@@ -17,7 +17,9 @@ mkdir -p $TARGET_DIR
 
 echo "Downloading package from github..."
 
-curl -sLk -o $ZIP_PACKAGE https://github.com/FrostDigital/fruster-scripts/archive/master.zip
+#curl -sLk -o $ZIP_PACKAGE https://github.com/FrostDigital/fruster-scripts/archive/master.zip
+
+curl -sLk -o $ZIP_PACKAGE https://github.com/paceUP/fruster-scripts/archive/refs/heads/main.zip
 
 echo "Extracting..."
 
